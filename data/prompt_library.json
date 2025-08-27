@@ -1,0 +1,151 @@
+{
+  "categories": {
+    "photography": {
+      "name": "Photography",
+      "description": "Photorealistic prompts for various photography styles",
+      "prompts": [
+        {
+          "id": "photo-portrait-1",
+          "title": "Professional Portrait",
+          "content": "Professional headshot portrait of a confident businesswoman, studio lighting, sharp focus, 85mm lens, shallow depth of field, clean background",
+          "description": "Professional business portrait with studio lighting",
+          "tags": ["portrait", "professional", "studio", "business"],
+          "parameters": {
+            "aspect_ratio": "3:4",
+            "quality": "high",
+            "style": "photorealistic"
+          }
+        },
+        {
+          "id": "photo-landscape-1",
+          "title": "Golden Hour Landscape",
+          "content": "Breathtaking landscape photography of rolling hills during golden hour, warm soft light, dramatic sky with clouds, wide-angle shot, high dynamic range",
+          "description": "Stunning landscape with golden hour lighting",
+          "tags": ["landscape", "golden-hour", "nature", "wide-angle"],
+          "parameters": {
+            "aspect_ratio": "16:9",
+            "quality": "ultra",
+            "lighting": "golden-hour"
+          }
+        }
+      ]
+    },
+    "cyberpunk": {
+      "name": "Cyberpunk",
+      "description": "Futuristic cyberpunk aesthetics with neon lights",
+      "prompts": [
+        {
+          "id": "cyber-city-1",
+          "title": "Neon City Street",
+          "content": "Cyberpunk city street at night, neon signs reflecting in wet asphalt, flying cars in the distance, rain, atmospheric fog, blue and pink lighting, cinematic",
+          "description": "Classic cyberpunk street scene with neon aesthetics",
+          "tags": ["cyberpunk", "neon", "city", "night", "rain"],
+          "parameters": {
+            "aspect_ratio": "16:9",
+            "style": "cyberpunk",
+            "mood": "atmospheric"
+          }
+        }
+      ]
+    },
+    "fantasy": {
+      "name": "Fantasy",
+      "description": "Magical and fantastical scenes",
+      "prompts": [
+        {
+          "id": "fantasy-forest-1",
+          "title": "Enchanted Forest",
+          "content": "Mystical enchanted forest with glowing mushrooms, fireflies, ancient twisted trees, soft ethereal lighting, magical atmosphere, fantasy art style",
+          "description": "Magical forest scene with bioluminescent elements",
+          "tags": ["fantasy", "forest", "magic", "bioluminescent"],
+          "parameters": {
+            "style": "fantasy-art",
+            "lighting": "ethereal",
+            "mood": "mystical"
+          }
+        }
+      ]
+    },
+    "video": {
+      "name": "Video Prompts",
+      "description": "Prompts optimized for video generation",
+      "prompts": [
+        {
+          "id": "video-timelapse-1",
+          "title": "City Timelapse",
+          "content": "Time-lapse of a bustling city street from day to night, traffic flowing, lights turning on in buildings, smooth camera movement",
+          "description": "Dynamic city timelapse showing day to night transition",
+          "tags": ["timelapse", "city", "traffic", "day-to-night"],
+          "parameters": {
+            "duration": "10s",
+            "camera_movement": "static",
+            "effect": "timelapse"
+          }
+        }
+      ]
+    }
+  },
+  "featured": [
+    "photo-portrait-1",
+    "cyber-city-1",
+    "fantasy-forest-1"
+  ],
+  "auto_complete": {
+    "styles": [
+      "photorealistic",
+      "cinematic",
+      "anime style",
+      "cyberpunk",
+      "fantasy art",
+      "impressionism",
+      "3D render",
+      "oil painting",
+      "watercolor",
+      "digital art",
+      "concept art"
+    ],
+    "lighting": [
+      "cinematic lighting",
+      "golden hour",
+      "neon lighting",
+      "studio lighting",
+      "backlight",
+      "rim light",
+      "soft lighting",
+      "dramatic lighting",
+      "natural lighting",
+      "ambient lighting"
+    ],
+    "camera": [
+      "close-up shot",
+      "wide-angle shot",
+      "low-angle",
+      "high-angle",
+      "dutch angle",
+      "drone shot",
+      "85mm lens",
+      "35mm lens",
+      "macro shot",
+      "telephoto"
+    ],
+    "quality": [
+      "4k",
+      "8k",
+      "highly detailed",
+      "sharp focus",
+      "masterpiece",
+      "ultra detailed",
+      "high resolution",
+      "professional"
+    ],
+    "artists": [
+      "by Greg Rutkowski",
+      "by Artgerm",
+      "by Alphonse Mucha",
+      "by Thomas Kinkade",
+      "by John Singer Sargent",
+      "by Annie Leibovitz",
+      "by Ansel Adams"
+    ]
+  }
+}
