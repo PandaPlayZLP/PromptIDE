@@ -122,11 +122,16 @@ export class ChatGPTService {
 
   private async postWithModelFallback(bodyBuilder: (model: string) => any): Promise<Response> {
     const primaryModel = this.getModelOrDefault()
+    const apiKey = this.settings!.apiKey
+    if (!apiKey || apiKey.trim().length === 0) {
+      // Simulate a 400 to fall into existing error flow
+      return new Response(JSON.stringify({ error: { message: 'Missing API key' } }), { status: 400 })
+    }
     const resp = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.settings!.apiKey}`
+        'Authorization': `Bearer ${apiKey}`
       },
       body: JSON.stringify(bodyBuilder(primaryModel))
     })
@@ -134,7 +139,7 @@ export class ChatGPTService {
 
     // Try fallback if model not found/unsupported
     try {
-      const err = await resp.json()
+      const err = await resp.json().catch(() => ({}))
       const msg = err?.error?.message?.toLowerCase?.() || ''
       if (resp.status === 404 || msg.includes('model') && (msg.includes('not') || msg.includes('unknown'))) {
         const fallbackModel = 'gpt-4o'
@@ -143,7 +148,7 @@ export class ChatGPTService {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'Authorization': `Bearer ${this.settings!.apiKey}`
+              'Authorization': `Bearer ${apiKey}`
             },
             body: JSON.stringify(bodyBuilder(fallbackModel))
           })

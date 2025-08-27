@@ -179,6 +179,18 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
   const [movePickerFor, setMovePickerFor] = useState<string | null>(null)
   const [searchText, setSearchText] = useState('')
 
+  const dedupeById = <T extends { id: string }>(items: T[]): T[] => {
+    const seen = new Set<string>()
+    const result: T[] = []
+    for (const item of items) {
+      if (!seen.has(item.id)) {
+        seen.add(item.id)
+        result.push(item)
+      }
+    }
+    return result
+  }
+
   const getChildFolders = (parentId?: string) => {
     return (Array.isArray(folders) ? folders : []).filter(f => f.parentId === parentId)
   }
@@ -205,30 +217,41 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
       try {
         onProgress?.(0.05, 'Lade Ordner…')
         const savedFolders = await storage.loadData('folders')
+        let normalizedFolders: FolderStructure[] = []
         if (Array.isArray(savedFolders) && savedFolders.length > 0) {
-          const normalized = savedFolders.map((f: any) => ({
+          normalizedFolders = dedupeById(savedFolders.map((f: any) => ({
             ...f,
             iconName: f.iconName || 'folder',
             parentId: f.parentId || undefined
-          }))
-          setFolders(normalized)
+          })))
+          setFolders(normalizedFolders)
+          try { await storage.saveDataNow('folders', normalizedFolders) } catch {}
         }
         onProgress?.(0.25, 'Lade Metadaten…')
         const meta = await loadAllMeta()
         setPromptMeta(meta)
         onProgress?.(0.55, 'Lade Prompts…')
-        const savedPrompts = await listDbMyPrompts()
+        const savedPrompts = dedupeById(await listDbMyPrompts())
         if (Array.isArray(savedPrompts)) {
           const merged = (savedPrompts as any).map((p: any) => ({ ...p, ...(meta[p.id] || {}) }))
           setPrompts(merged)
-          setFolders((foldersToUse: any) => (Array.isArray(savedFolders) && savedFolders.length > 0 ? savedFolders : folders).map((folder: FolderStructure) => ({
+          const baseFolders = (Array.isArray(normalizedFolders) && normalizedFolders.length > 0)
+            ? normalizedFolders
+            : folders
+          const existingIds = new Set((baseFolders as FolderStructure[]).map(f => f.id))
+          const hydrated = baseFolders.map((folder: FolderStructure) => ({
             ...folder,
             iconName: folder.iconName || 'folder',
             prompts: folder.id === 'all-prompts' 
-              ? (merged as any).filter((p: Prompt) => (!p.folder || p.folder === 'all-prompts'))
+              ? (merged as any).filter((p: Prompt) => (!p.folder || p.folder === 'all-prompts' || !existingIds.has(p.folder as string)))
               : (merged as any).filter((p: Prompt) => p.folder === folder.id)
-          })))
+          }))
+          setFolders(hydrated)
+          // Persist folders so they appear across devices
+          try { await storage.saveDataNow('folders', baseFolders as any) } catch {}
           setBookmarkedPrompts((merged as any).filter((p: Prompt) => p.is_bookmarked))
+          // Persist meta back if any prompt lacked meta.map
+          try { await storage.saveDataNow('prompt_meta', meta) } catch {}
         }
         onProgress?.(0.95, 'Finalisiere…')
         if (onLoaded) onLoaded()
@@ -248,7 +271,7 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
     const handleStorageChange = async () => {
       const meta = await loadAllMeta()
       setPromptMeta(meta)
-      const savedPrompts = await listDbMyPrompts()
+      const savedPrompts = dedupeById(await listDbMyPrompts())
       if (Array.isArray(savedPrompts)) {
         const merged = (savedPrompts as any).map((p: any) => ({ ...p, ...(meta[p.id] || {}) }))
         setPrompts(merged)
@@ -265,7 +288,7 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
     const handlePromptsUpdated = (e: CustomEvent) => {
       const { prompts: updatedPrompts } = e.detail
       // Merge with current promptMeta so folder/bookmark assignments persist even if the event lacks meta
-      const merged = (updatedPrompts as Prompt[]).map((p: any) => ({ ...p, ...(promptMeta[p.id] || {}) }))
+      const merged = dedupeById((updatedPrompts as Prompt[]).map((p: any) => ({ ...p, ...(promptMeta[p.id] || {}) })))
       setPrompts(merged)
       setFolders(currentFolders => currentFolders.map(folder => ({
         ...folder,
@@ -353,8 +376,9 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
         : p
     )
     setPrompts(updatedPrompts)
-    try { await storage.saveData('prompts', updatedPrompts) } catch {}
-    try { await updateDbPrompt(promptId, { title: newTitle.trim() }) } catch {}
+    // Persist in background; don't await to keep UI snappy
+    void storage.saveData('prompts', updatedPrompts).catch(() => {})
+    void updateDbPrompt(promptId, { title: newTitle.trim() }).catch(() => {})
     window.dispatchEvent(new CustomEvent('prompts-updated', { detail: { prompts: updatedPrompts } }))
     setEditingPrompt(null)
     toast.success('Prompt umbenannt!')
@@ -383,7 +407,9 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
     }
     const updatedFolders = [...folders, newFolder]
     setFolders(updatedFolders)
-    await storage.saveData('folders', updatedFolders)
+    void storage.saveDataNow('folders', updatedFolders)
+      .then(() => toast.success('Ordner online gespeichert'))
+      .catch(() => toast.error('Ordner-Cloud-Speichern fehlgeschlagen'))
     setEditingFolder(newFolder.id)
     setSelectedFolder(newFolder.id)
     setExpandedFolders(prev => prev.includes(newFolder.id) ? prev : [...prev, newFolder.id])
@@ -403,7 +429,9 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
     }
     const updatedFolders = folders.filter(f => f.id !== folderId)
     setFolders(updatedFolders)
-    await storage.saveData('folders', updatedFolders)
+    void storage.saveDataNow('folders', updatedFolders)
+      .then(() => toast.success('Ordner-Änderung online gespeichert'))
+      .catch(() => toast.error('Ordner-Cloud-Speichern fehlgeschlagen'))
     toast.success('Ordner gelöscht!')
   }
 
@@ -418,7 +446,9 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
         : f
     )
     setFolders(updatedFolders)
-    await storage.saveData('folders', updatedFolders)
+    void storage.saveDataNow('folders', updatedFolders)
+      .then(() => toast.success('Ordner umbenannt (online)'))
+      .catch(() => toast.error('Ordner-Cloud-Speichern fehlgeschlagen'))
     setEditingFolder(null)
     toast.success('Ordner umbenannt!')
   }
@@ -430,7 +460,9 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
         : f
     )
     setFolders(updatedFolders)
-    await storage.saveData('folders', updatedFolders)
+    void storage.saveDataNow('folders', updatedFolders)
+      .then(() => toast.success('Ordner-Icon online gespeichert'))
+      .catch(() => toast.error('Ordner-Cloud-Speichern fehlgeschlagen'))
     setIconPickerFor(null)
     toast.success('Ordner-Icon geändert!')
   }
@@ -544,7 +576,9 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
           f.id === movingFolder.id ? { ...f, parentId: undefined } : f
         )
         setFolders(updatedFolders)
-        await storage.saveData('folders', updatedFolders)
+        void storage.saveDataNow('folders', updatedFolders)
+          .then(() => toast.success('Ordner nach Root (online)'))
+          .catch(() => toast.error('Ordner-Cloud-Speichern fehlgeschlagen'))
         setDraggedItem(null)
         setIsDragging(false)
         toast.success('Ordner nach „Alle Prompts“ verschoben!')
@@ -567,7 +601,9 @@ export function Sidebar({ activeSection, onSectionChange, isCollapsed, onToggleC
         f.id === movingFolder.id ? { ...f, parentId: targetFolderId } : f
       )
       setFolders(updatedFolders)
-      await storage.saveData('folders', updatedFolders)
+      void storage.saveDataNow('folders', updatedFolders)
+        .then(() => toast.success('Ordner verschoben (online)'))
+        .catch(() => toast.error('Ordner-Cloud-Speichern fehlgeschlagen'))
       setDraggedItem(null)
       setIsDragging(false)
       toast.success('Ordner verschoben!')

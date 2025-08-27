@@ -4,6 +4,30 @@ import { doc, getDoc, setDoc, deleteDoc } from 'firebase/firestore'
 
 const storageMode: 'cloud' | 'hybrid' = ((import.meta as any).env?.VITE_STORAGE_MODE === 'cloud') ? 'cloud' : 'hybrid'
 
+// Debounced cloud write queue to avoid overwhelming Firestore with per-keystroke updates
+type WriteTask = {
+  timer: any
+  inflight: boolean
+  pendingValue: unknown
+  lastWriteAt?: number
+  pendingSeq: number
+}
+
+const writeTasks = new Map<string, WriteTask>()
+const latestSeqByKey = new Map<string, number>()
+const DEFAULT_DEBOUNCE_MS = Number((import.meta as any).env?.VITE_FIRESTORE_DEBOUNCE_MS) || 1500
+const KEY_SPECIFIC_DEBOUNCE_MS: Record<string, number> = {
+  // Heavier payload, edited frequently
+  prompts: Number((import.meta as any).env?.VITE_FIRESTORE_PROMPTS_DEBOUNCE_MS) || 2000,
+  folders: Number((import.meta as any).env?.VITE_FIRESTORE_FOLDERS_DEBOUNCE_MS) || 1200,
+}
+
+// Keys that can be large and should be stored chunked in multiple documents
+const CHUNKED_KEYS = new Set<string>(['prompts', 'folders'])
+// Large object maps (id -> meta) that we store as chunked object shards
+const CHUNKED_OBJECT_KEYS = new Set<string>(['prompt_meta'])
+const DEFAULT_CHUNK_BYTES = Number((import.meta as any).env?.VITE_FIRESTORE_CHUNK_BYTES) || 200_000
+
 localforage.config({
   name: 'prompt-ide',
   storeName: 'kv',
@@ -51,6 +75,9 @@ function getCurrentUserId(): string | null {
 }
 
 async function readFromFirestore<T>(key: string): Promise<T | undefined> {
+  // Route chunked keys to chunked reader
+  if (CHUNKED_KEYS.has(key)) return readFromFirestoreChunked<T>(key)
+  if (CHUNKED_OBJECT_KEYS.has(key)) return readFromFirestoreChunkedObject<T>(key)
   const fb = getFirebase() || initFirebaseIfConfigured()
   if (!fb) return undefined
   const uid = getCurrentUserId()
@@ -71,17 +98,248 @@ async function writeToFirestore<T>(key: string, value: T): Promise<boolean> {
   return true
 }
 
+function encodeSizeBytes(obj: unknown): number {
+  try {
+    const s = JSON.stringify(obj)
+    return (typeof TextEncoder !== 'undefined') ? new TextEncoder().encode(s).length : s.length * 2
+  } catch {
+    return 0
+  }
+}
+
+function splitArrayIntoByteSizedChunks(items: any[], maxBytes: number): any[][] {
+  const chunks: any[][] = []
+  let current: any[] = []
+  let currentBytes = 2 // bracket overhead
+  const estimatedItemOverhead = 1 // comma
+  for (const it of items) {
+    const itBytes = encodeSizeBytes(it) + estimatedItemOverhead
+    if (current.length > 0 && currentBytes + itBytes > maxBytes) {
+      chunks.push(current)
+      current = []
+      currentBytes = 2
+    }
+    current.push(it)
+    currentBytes += itBytes
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+
+async function readFromFirestoreChunked<T>(key: string): Promise<T | undefined> {
+  const fb = getFirebase() || initFirebaseIfConfigured()
+  if (!fb) return undefined
+  const uid = getCurrentUserId()
+  if (!uid) return undefined
+  const indexRef = doc(fb.db, 'users', uid, 'kv', `${key}__index`)
+  const indexSnap = await getDoc(indexRef)
+  if (!indexSnap.exists()) return undefined
+  const numChunks = Number(indexSnap.data()?.numChunks || 0)
+  if (!numChunks) return ([] as any) as T
+  const results: any[] = []
+  for (let i = 0; i < numChunks; i++) {
+    const chunkRef = doc(fb.db, 'users', uid, 'kv', `${key}__c_${i}`)
+    const snap = await getDoc(chunkRef)
+    if (snap.exists()) {
+      const arr = (snap.data()?.value as any[]) || []
+      for (const x of arr) results.push(x)
+    }
+  }
+  return (results as any) as T
+}
+
+async function writeToFirestoreChunked<T>(key: string, value: T): Promise<boolean> {
+  const fb = getFirebase() || initFirebaseIfConfigured()
+  if (!fb) return false
+  const uid = getCurrentUserId()
+  if (!uid) return false
+  if (!Array.isArray(value)) {
+    // Fallback: write as single doc
+    return writeToFirestore<T>(key, value)
+  }
+  const indexRef = doc(fb.db, 'users', uid, 'kv', `${key}__index`)
+  const prevIndexSnap = await getDoc(indexRef).catch(() => null as any)
+  const prevNum = Number(prevIndexSnap?.exists() ? (prevIndexSnap.data()?.numChunks || 0) : 0)
+  const chunks = splitArrayIntoByteSizedChunks(value as any[], DEFAULT_CHUNK_BYTES)
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkRef = doc(fb.db, 'users', uid, 'kv', `${key}__c_${i}`)
+    await setDoc(chunkRef, { value: chunks[i], updated_at: Date.now() }, { merge: true })
+  }
+  // Delete leftover chunk docs if any
+  for (let i = chunks.length; i < prevNum; i++) {
+    const leftoverRef = doc(fb.db, 'users', uid, 'kv', `${key}__c_${i}`)
+    await deleteDoc(leftoverRef).catch(() => {})
+  }
+  await setDoc(indexRef, { numChunks: chunks.length, updated_at: Date.now() }, { merge: true })
+  return true
+}
+
+function splitObjectIntoByteSizedChunks(obj: Record<string, any>, maxBytes: number): Array<Record<string, any>> {
+  const entries = Object.entries(obj)
+  const chunks: Array<Record<string, any>> = []
+  let current: Record<string, any> = {}
+  let currentBytes = 2 // braces overhead
+  for (const [k, v] of entries) {
+    const entryBytes = encodeSizeBytes({ [k]: v }) + 1
+    if (Object.keys(current).length > 0 && currentBytes + entryBytes > maxBytes) {
+      chunks.push(current)
+      current = {}
+      currentBytes = 2
+    }
+    current[k] = v
+    currentBytes += entryBytes
+  }
+  if (Object.keys(current).length > 0) chunks.push(current)
+  return chunks
+}
+
+async function readFromFirestoreChunkedObject<T>(key: string): Promise<T | undefined> {
+  const fb = getFirebase() || initFirebaseIfConfigured()
+  if (!fb) return undefined
+  const uid = getCurrentUserId()
+  if (!uid) return undefined
+  const indexRef = doc(fb.db, 'users', uid, 'kv', `${key}__obj_index`)
+  const indexSnap = await getDoc(indexRef)
+  if (!indexSnap.exists()) return undefined
+  const numChunks = Number(indexSnap.data()?.numChunks || 0)
+  const result: Record<string, any> = {}
+  for (let i = 0; i < numChunks; i++) {
+    const chunkRef = doc(fb.db, 'users', uid, 'kv', `${key}__obj_c_${i}`)
+    const snap = await getDoc(chunkRef)
+    if (snap.exists()) {
+      Object.assign(result, (snap.data()?.value as Record<string, any>) || {})
+    }
+  }
+  return (result as any) as T
+}
+
+async function writeToFirestoreChunkedObject<T>(key: string, value: T): Promise<boolean> {
+  const fb = getFirebase() || initFirebaseIfConfigured()
+  if (!fb) return false
+  const uid = getCurrentUserId()
+  if (!uid) return false
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return writeToFirestore<T>(key, value)
+  }
+  const obj = value as unknown as Record<string, any>
+  const chunks = splitObjectIntoByteSizedChunks(obj, DEFAULT_CHUNK_BYTES)
+  const indexRef = doc(fb.db, 'users', uid, 'kv', `${key}__obj_index`)
+  const prevIndexSnap = await getDoc(indexRef).catch(() => null as any)
+  const prevNum = Number(prevIndexSnap?.exists() ? (prevIndexSnap.data()?.numChunks || 0) : 0)
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkRef = doc(fb.db, 'users', uid, 'kv', `${key}__obj_c_${i}`)
+    await setDoc(chunkRef, { value: chunks[i], updated_at: Date.now() }, { merge: true })
+  }
+  for (let i = chunks.length; i < prevNum; i++) {
+    const leftoverRef = doc(fb.db, 'users', uid, 'kv', `${key}__obj_c_${i}`)
+    await deleteDoc(leftoverRef).catch(() => {})
+  }
+  await setDoc(indexRef, { numChunks: chunks.length, updated_at: Date.now() }, { merge: true })
+  return true
+}
+
+async function writeCloud<T>(key: string, value: T): Promise<boolean> {
+  if (CHUNKED_KEYS.has(key)) return writeToFirestoreChunked<T>(key, value)
+  if (CHUNKED_OBJECT_KEYS.has(key)) return writeToFirestoreChunkedObject<T>(key, value)
+  return writeToFirestore<T>(key, value)
+}
+
+function scheduleCloudWrite<T>(key: string, value: T) {
+  const seq = (latestSeqByKey.get(key) || 0)
+  const delay = KEY_SPECIFIC_DEBOUNCE_MS[key] ?? DEFAULT_DEBOUNCE_MS
+  const existing = writeTasks.get(key)
+  const task: WriteTask = existing || { timer: null, inflight: false, pendingValue: value, pendingSeq: seq }
+  task.pendingValue = value
+  task.pendingSeq = seq
+  if (task.timer) clearTimeout(task.timer)
+  task.timer = setTimeout(async () => {
+    // Skip if no Firebase/user available
+    const fb = getFirebase() || initFirebaseIfConfigured()
+    const uid = getCurrentUserId()
+    if (!fb || !uid) return
+    if (task.inflight) {
+      // Try again shortly after current inflight completes
+      scheduleCloudWrite(key, task.pendingValue as T)
+      return
+    }
+    task.inflight = true
+    const valueToWrite = task.pendingValue as T
+    const seqToWrite = task.pendingSeq
+    try {
+      // Drop stale writes (older than the latest sequence recorded for this key)
+      const latest = latestSeqByKey.get(key) || 0
+      if (seqToWrite < latest) {
+        // Stale write; skip
+      } else {
+        await writeCloud<T>(key, valueToWrite)
+      }
+      task.lastWriteAt = Date.now()
+    } catch (err) {
+      // Swallow to prevent UI disruption; Firestore SDK will backoff
+      if (typeof console !== 'undefined') {
+        console.warn('[PromptIDE] Firestore write failed for key', key, err)
+      }
+    } finally {
+      task.inflight = false
+      // If a newer value was queued while writing, schedule another flush soon
+      if (task.pendingValue !== valueToWrite) {
+        setTimeout(() => scheduleCloudWrite(key, task.pendingValue as T), 250)
+      }
+    }
+  }, delay)
+  writeTasks.set(key, task)
+}
+
+function cancelScheduledWrite(key: string) {
+  const task = writeTasks.get(key)
+  if (task?.timer) {
+    clearTimeout(task.timer)
+  }
+  writeTasks.delete(key)
+}
+
 async function deleteFromFirestore(key: string): Promise<boolean> {
   const fb = getFirebase() || initFirebaseIfConfigured()
   if (!fb) return false
   const uid = getCurrentUserId()
   if (!uid) return false
+  if (CHUNKED_KEYS.has(key)) {
+    const indexRef = doc(fb.db, 'users', uid, 'kv', `${key}__index`)
+    const indexSnap = await getDoc(indexRef).catch(() => null as any)
+    const num = Number(indexSnap?.exists() ? (indexSnap.data()?.numChunks || 0) : 0)
+    for (let i = 0; i < num; i++) {
+      const chunkRef = doc(fb.db, 'users', uid, 'kv', `${key}__c_${i}`)
+      await deleteDoc(chunkRef).catch(() => {})
+    }
+    await deleteDoc(indexRef).catch(() => {})
+    return true
+  }
+  if (CHUNKED_OBJECT_KEYS.has(key)) {
+    const indexRef = doc(fb.db, 'users', uid, 'kv', `${key}__obj_index`)
+    const indexSnap = await getDoc(indexRef).catch(() => null as any)
+    const num = Number(indexSnap?.exists() ? (indexSnap.data()?.numChunks || 0) : 0)
+    for (let i = 0; i < num; i++) {
+      const chunkRef = doc(fb.db, 'users', uid, 'kv', `${key}__obj_c_${i}`)
+      await deleteDoc(chunkRef).catch(() => {})
+    }
+    await deleteDoc(indexRef).catch(() => {})
+    return true
+  }
   const ref = doc(fb.db, 'users', uid, 'kv', key)
   await deleteDoc(ref)
   return true
 }
 
 export const storage = {
+  async loadLocalMirror<T = any>(key: string): Promise<T> {
+    const defVal: any = key === 'prompts' || key === 'folders' ? [] : {}
+    try {
+      const data = await migrateIfNeeded<T>(key, defVal)
+      return (data as any) ?? defVal
+    } catch {
+      return defVal as T
+    }
+  },
   async loadData<T = any>(key: string): Promise<T> {
     // Never store or read API keys from cloud. Settings are local-only.
     if (key === 'settings') {
@@ -117,16 +375,65 @@ export const storage = {
       await localforage.setItem(key, value as any)
       return
     }
+    // Always persist locally immediately to avoid data loss
+    await localforage.setItem(key, value as any)
+
+    // For big payloads (e.g., entire prompts list), avoid exceeding Firestore 1 MiB/doc limit.
+    // If too large, skip cloud sync and keep local-only to prevent 400 Invalid Argument errors.
+    const safeToCloudSync = (() => {
+      try {
+        const json = JSON.stringify(value)
+        const bytes = (typeof TextEncoder !== 'undefined') ? new TextEncoder().encode(json).length : json.length * 2
+        const threshold = Number((import.meta as any).env?.VITE_FIRESTORE_DOC_SIZE_THRESHOLD_BYTES) || 800_000
+        // Additionally, allow forcing local-only for certain keys
+        const forceLocalKeys = String((import.meta as any).env?.VITE_FIRESTORE_LOCAL_ONLY_KEYS || '')
+          .split(',')
+          .map((k: string) => k.trim())
+          .filter(Boolean)
+        if (forceLocalKeys.includes(key)) return false
+        // Chunked keys are always safe to cloud-sync (handled by chunking)
+        if (CHUNKED_KEYS.has(key)) return true
+        return bytes < (threshold + 100_000) // small buffer under 1 MiB hard limit
+      } catch {
+        return true
+      }
+    })()
+
+    // Schedule debounced cloud write when Firebase is configured and a user is present
+    const fb = getFirebase() || initFirebaseIfConfigured()
     const hasFirebaseUser = !!getCurrentUserId()
-    const written = await writeToFirestore<T>(key, value).catch(() => false)
-    if (storageMode === 'cloud') {
-      // Always mirror locally to prevent accidental data loss; if cloud write fails, keep local copy
+    if (fb && hasFirebaseUser && safeToCloudSync) {
+      // bump sequence to mark this as the latest state for the key
+      latestSeqByKey.set(key, (latestSeqByKey.get(key) || 0) + 1)
+      scheduleCloudWrite<T>(key, value)
+      return
+    }
+    // In cloud-only mode, if cloud not available, local mirror is still kept
+  },
+  async saveDataNow<T = any>(key: string, value: T): Promise<void> {
+    // Immediate write variant: write local, then cloud without debounce
+    if (key === 'settings') {
       await localforage.setItem(key, value as any)
       return
     }
-    // Hybrid: fall back to local if cloud write fails
-    if (!written) await localforage.setItem(key, value as any)
-    else await localforage.setItem(key, value as any)
+    await localforage.setItem(key, value as any)
+    const fb = getFirebase() || initFirebaseIfConfigured()
+    const uid = getCurrentUserId()
+    const hasFirebaseUser = !!uid
+    if (fb && hasFirebaseUser) {
+      // Cancel any pending debounced writes and bump sequence to invalidate older writes
+      cancelScheduledWrite(key)
+      latestSeqByKey.set(key, (latestSeqByKey.get(key) || 0) + 1)
+      try { await writeCloud<T>(key, value) } catch (err) {
+        if (typeof console !== 'undefined') {
+          console.warn('[PromptIDE] Cloud write FAILED for key', key, err)
+        }
+      }
+      return
+    }
+    if (typeof console !== 'undefined') {
+      console.warn('[PromptIDE] Skipping cloud write for key', key, '— no Firebase user or Firebase not initialized')
+    }
   },
   async deleteData(key: string): Promise<void> {
     const deleted = await deleteFromFirestore(key).catch(() => false)

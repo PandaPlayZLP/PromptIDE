@@ -17,7 +17,8 @@ export async function loadAllMeta(): Promise<PromptMetaMap> {
 }
 
 export async function saveAllMeta(map: PromptMetaMap): Promise<void> {
-  await storage.saveData(META_KEY, map)
+  // Write immediately so previews/folders/bookmarks sync across devices
+  await storage.saveDataNow(META_KEY, map)
 }
 
 export async function upsertMeta(promptId: string, patch: Partial<PromptMeta>): Promise<PromptMeta> {
